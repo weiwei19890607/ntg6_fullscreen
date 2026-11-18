@@ -1,0 +1,11 @@
+/.tools/
+/artifacts/
+/logs/*
+!/logs/README.md
+__pycache__/
+*.pk8
+*.p7b
+*.pem
+*.key
+
+/certificate/

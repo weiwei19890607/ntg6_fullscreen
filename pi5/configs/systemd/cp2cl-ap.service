@@ -1,0 +1,13 @@
+[Unit]
+Description=cp2cl Wi-Fi access point
+After=NetworkManager.service
+Before=cp2cl.service
+StartLimitIntervalSec=0
+[Service]
+Type=forking
+PIDFile=/run/hostapd.pid
+ExecStartPre=/usr/local/libexec/cp2cl-prepare network
+ExecStart=/usr/local/libexec/cp2cl-prepare ap
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=45

@@ -1,0 +1,488 @@
+diff --git a/assets/web/index.html b/assets/web/index.html
+index 84bbf63..0511615 100644
+--- a/assets/web/index.html
++++ b/assets/web/index.html
+@@ -88,7 +88,7 @@
+     color:var(--weui-FG-0);background:none;-webkit-appearance:none;appearance:none}
+   .weui-btn-area{margin-top:26px;display:flex;justify-content:center;gap:12px}
+   .weui-btn-area .weui-btn{margin:0;min-width:0;width:136px}
+-  #set-restart,#set-reboot,#set-reset-all{width:284px}
++  #set-restart,#set-reboot,#set-reset-all,#set-maintenance,#set-normal,#set-poweroff{width:284px;max-width:100%}
+   /* The dialog is shown by taking `hidden` off, so the two rules that lay it
+      out have to give way to it. */
+   .weui-mask[hidden],.weui-dialog[hidden]{display:none}
+@@ -161,6 +161,14 @@
+     <div class="weui-btn-area">
+       <button class="weui-btn weui-btn_warn" id="set-reset-all">恢复出厂设置</button>
+     </div>
++    <div class="weui-cells__title">运行模式与关机</div>
++    <p class="stamp" id="system-mode" role="status">正在读取运行模式…</p>
++    <p class="stamp" id="bluetooth-gate" role="status"></p>
++    <div id="system-controls" hidden>
++      <div class="weui-btn-area"><button class="weui-btn weui-btn_default" id="set-maintenance">开启维护模式</button></div>
++      <div class="weui-btn-area"><button class="weui-btn weui-btn_default" id="set-normal">开启普通模式</button></div>
++      <div class="weui-btn-area"><button class="weui-btn weui-btn_warn" id="set-poweroff">关机</button></div>
++    </div>
+     <p class="stamp" id="set-stamp">正在读取…</p>
+   </div>
+ </div>
+@@ -787,6 +795,7 @@ function shown(screen) {
+ }
+
+ async function loadSettings() {
++  loadSystemMode();
+   try {
+     const response = await fetch("/api/settings", { cache: "no-store" });
+     if (!response.ok) throw new Error("HTTP " + response.status);
+@@ -834,8 +843,8 @@ async function saveSettings() {
+     saved = { width: size[0], height: size[1], fps };
+     shown(saved);
+     setStamp.className = "stamp";
+-    setStamp.textContent = "已保存 · " + now();
+-    showToast("保存成功，重启生效");
++    setStamp.textContent = (systemMode === "protected" ? "已临时保存，重启后恢复原设置 · " : "已保存 · ") + now();
++    showToast(systemMode === "protected" ? "临时修改不会永久保存，请先开启维护模式" : "保存成功，重启生效");
+   } catch (e) {
+     showToast("保存失败：" + e.message);
+   }
+@@ -928,6 +937,94 @@ document.getElementById("confirm-ok").addEventListener("click", () => {
+   if (action) action();
+ });
+
++// Pi storage mode and graceful power actions.
++let systemMode = "unavailable";
++let systemBootId = null;
++let systemTransition = null;
++let systemModeLoading = false;
++const systemModeText = document.getElementById("system-mode");
++const bluetoothGateText = document.getElementById("bluetooth-gate");
++async function systemFetch(url, options = {}) {
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), 5000);
++  try { return await fetch(url, { ...options, cache: "no-store", signal: controller.signal }); }
++  finally { clearTimeout(timer); }
++}
++async function loadSystemMode() {
++  if (systemModeLoading) return;
++  systemModeLoading = true;
++  try {
++    const response = await systemFetch("/api/system");
++    const data = await response.json();
++    if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
++    document.getElementById("system-controls").hidden = !data.supported;
++    if (!data.supported) { systemModeText.textContent = "当前环境不支持设备管理。"; return; }
++    if (systemBootId && data.boot_id && systemBootId !== data.boot_id) {
++      location.reload(); return;
++    }
++    systemBootId = data.boot_id || systemBootId;
++    systemMode = data.current;
++    if (systemTransition || data.pending) {
++      systemModeText.textContent = systemTransition === "poweroff"
++        ? "关机请求已提交，请等待关机完成后再断电。热点会断开。"
++        : "设备正在重启，等待热点恢复后会自动重新读取状态。";
++    } else {
++      systemModeText.textContent = data.current === "protected"
++        ? "当前：普通模式（只读保护）。修改重启后丢失；永久保存请先开启维护模式。"
++        : "当前：维护模式。配置和配对会永久保存；完成后请切回普通模式。";
++      if (data.next_boot !== data.current) systemModeText.textContent += " 下次启动模式已更改，等待重启。";
++    }
++    const busy = Boolean(systemTransition || data.pending);
++    document.getElementById("set-maintenance").disabled = busy || (data.current === "maintenance" && data.next_boot === "maintenance");
++    document.getElementById("set-normal").disabled = busy || (data.current === "protected" && data.next_boot === "protected");
++    document.getElementById("set-poweroff").disabled = busy;
++    try {
++      const statusResponse = await systemFetch("/api/status");
++      if (!statusResponse.ok) throw new Error("status unavailable");
++      const state = await statusResponse.json();
++      bluetoothGateText.textContent = !state.carlife?.session_up
++        ? "蓝牙：正在等待车机。建立 CarLife 车机会话后才开放 CarPlay 配对；仅连接热点不能启动 CarPlay。"
++        : state.carplay?.video?.active
++          ? "CarPlay 已连接，手机视频流已建立。连接后蓝牙可能自动断开，由 Wi-Fi 继续传输。"
++          : "车机会话已就绪，可在 iPhone 蓝牙设置中连接 " + (state.carplay?.name || "本设备") + "。";
++    } catch (_) { bluetoothGateText.textContent = "蓝牙连接状态暂时不可用，正在自动重试。"; }
++  } catch (e) {
++    systemModeText.textContent = systemTransition === "poweroff"
++      ? "关机请求已提交，管理连接已断开。请等待系统关机完成后再断电。"
++      : "连接暂时中断，正在自动重试。请确认手机仍连接树莓派热点。";
++    for (const id of ["set-maintenance", "set-normal", "set-poweroff"]) document.getElementById(id).disabled = true;
++  } finally { systemModeLoading = false; }
++}
++async function systemAction(action) {
++  const buttons = Array.from(document.querySelectorAll(".weui-btn"));
++  const previous = buttons.map(b => b.disabled);
++  systemTransition = action;
++  buttons.forEach(b => { b.disabled = true; });
++  try {
++    const response = await systemFetch("/api/system/" + action, {
++      method: "POST", headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ confirm: true }),
++    });
++    const data = await response.json();
++    if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
++    systemModeText.textContent = action === "poweroff"
++      ? "关机请求已接受，请等待系统完成关机后再断电。热点随后会断开。"
++      : "模式已设置，设备即将重启。热点恢复后会自动重新读取状态。";
++    showToast(action === "poweroff" ? "正在正常关机…" : "正在切换模式并重启…");
++  } catch (e) {
++    systemTransition = null;
++    buttons.forEach((b, i) => { b.disabled = previous[i]; });
++    showToast("操作失败：" + e.message);
++    loadSystemMode();
++  }
++}
++document.getElementById("set-maintenance").addEventListener("click", () => askConfirm(
++  "开启维护模式", "设备将重启，之后修改的配置与手机配对会永久保存。当前普通模式中的临时修改不会自动保存。", () => systemAction("maintenance")));
++document.getElementById("set-normal").addEventListener("click", () => askConfirm(
++  "开启普通模式", "设备将重启并开启只读保护。维护期间已保存的配置会保留，之后的临时修改在重启后丢弃。", () => systemAction("normal")));
++document.getElementById("set-poweroff").addEventListener("click", () => askConfirm(
++  "关机", "CarPlay 和热点将断开。请等待系统完成关机后再断电，重新上电后设备才会启动。", () => systemAction("poweroff")));
++
+ // ---------------------------------------------------------------- tabs ----
+
+ // The tab in view is part of the address, so a reload or a link to the page
+@@ -955,7 +1052,7 @@ function select(name) {
+   // Whatever is not being looked at is not asked for: the board has better
+   // things to do with its CPU than answer a hidden tab.
+   if (name === "status") statusTick();
+-  if (name === "settings" && !settingsRead) loadSettings();
++  if (name === "settings") { if (!settingsRead) loadSettings(); else loadSystemMode(); }
+   if (name === "log") {
+     // A box that was off screen had nowhere to keep its place, so it opens at
+     // the end: what the log is looked at for is what is happening now.
+@@ -979,6 +1076,7 @@ function schedule() {
+   if (document.hidden) return;
+   if (tab === "status") statusTick();
+   if (tab === "log") logTick();
++  if (tab === "settings" || systemTransition) loadSystemMode();
+ }
+
+ // The channel table is asked for before the first status, so the first answer is
+@@ -987,6 +1085,7 @@ loadChannels().then(() => {
+   select(tab);
+   setInterval(schedule, 2000);
+   document.addEventListener("visibilitychange", schedule);
++  window.addEventListener("online", schedule);
+ });
+ </script>
+ </body>
+diff --git a/src/config.rs b/src/config.rs
+index 8b13ec8..087c4c1 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -80,6 +80,18 @@ pub(crate) fn hostname() -> String {
+     read_hostname(Path::new("/proc/sys/kernel/hostname"))
+ }
+
++/// Bluetooth/CarPlay display name is independent of the Linux hostname.
++pub(crate) fn bluetooth_name() -> String {
++    std::fs::read_to_string(data_file("bluetooth-name"))
++        .ok().and_then(|s| bluetooth_label(&s)).unwrap_or_else(hostname)
++}
++
++fn bluetooth_label(value: &str) -> Option<String> {
++    let value = value.trim();
++    (!value.is_empty() && value.len() <= 248 && !value.chars().any(char::is_control))
++        .then(|| value.to_string())
++}
++
+ /// Split from the fixed path so that a machine which cannot say what it is
+ /// called is something a test can reach.
+ fn read_hostname(path: &Path) -> String {
+@@ -351,6 +363,14 @@ pub(crate) fn json(config: &Config) -> Value {
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn bluetooth_display_name_accepts_underscores_but_not_control_bytes() {
++        assert_eq!(super::bluetooth_label("raspberry_NTG6_BT\n").as_deref(), Some("raspberry_NTG6_BT"));
++        assert!(super::bluetooth_label(" ").is_none());
++        assert!(super::bluetooth_label("bad\0name").is_none());
++        assert!(super::bluetooth_label(&"x".repeat(249)).is_none());
++    }
++
+     use super::*;
+
+     #[test]
+diff --git a/src/logging.rs b/src/logging.rs
+index 9e1f1ff..3cd4536 100644
+--- a/src/logging.rs
++++ b/src/logging.rs
+@@ -583,6 +583,7 @@ mod tests {
+         let seen = Arc::new(Mutex::new(Vec::new()));
+         let sink = seen.clone();
+         let lines = tracing_subscriber::fmt()
++            .with_ansi(true)
+             .event_format(Line)
+             .with_writer(move || Sink(sink.clone()))
+             .finish();
+diff --git a/src/main.rs b/src/main.rs
+index 37f2952..2086f70 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,6 +10,7 @@
+ //! * this program, which owns the board — its settings, its lights, its page —
+ //!   and is what the two halves know of each other.
+
++mod preflight;
+ mod ap;
+ mod artwork;
+ mod assets;
+@@ -50,6 +51,12 @@ use crate::sink::ClSink;
+
+ #[tokio::main]
+ async fn main() -> Result<()> {
++    if std::env::args().nth(1).as_deref() == Some("--check") {
++        return preflight::check();
++    }
++    if std::env::args().nth(1).as_deref() == Some("--offline-web") {
++        return preflight::offline_web().await;
++    }
+     // Everything the program prints goes through this, so `log_level` in
+     // `/etc/cp2cl/config.json` is the only knob for how much of it is shown, and
+     // the levels are the usual ones: `error` is something we set out to do and
+@@ -148,7 +155,7 @@ async fn main() -> Result<()> {
+     // page is built around it rather than the other way round.
+     let report = Arc::new(Report::new());
+     report.with(|s| {
+-        s.carplay.name = hostname();
++        s.carplay.name = config::bluetooth_name();
+         s.carplay.bt_mac = config::bt_address(&cfg.bt_adapter);
+     });
+     let status = Arc::new(web::Status::new(report.clone()));
+@@ -257,7 +264,7 @@ async fn main() -> Result<()> {
+     let machine = Arc::new(carplay_hu::machine::Machine {
+         wifi_iface: cfg.wifi_iface.clone(),
+         bt_adapter: cfg.bt_adapter.clone(),
+-        name: hostname(),
++        name: config::bluetooth_name(),
+         vendor: config::dt_vendor(),
+         bt_address: config::bt_address(&cfg.bt_adapter),
+         data_dir: data_dir.clone(),
+diff --git a/src/web/mod.rs b/src/web/mod.rs
+index 064db5f..3ce969f 100644
+--- a/src/web/mod.rs
++++ b/src/web/mod.rs
+@@ -23,6 +23,7 @@
+ pub mod log;
+ pub mod settings;
+ pub mod status;
++pub mod system;
+
+ // The snapshot the page reads, built by name rather than by assignment.
+ pub use status::Status;
+@@ -93,6 +94,10 @@ pub async fn serve(
+         .route("/api/restart", post(settings::restart))
+         .route("/api/reset", post(settings::factory_reset))
+         .route("/api/reboot", post(settings::reboot))
++        .route("/api/system", get(system::status))
++        .route("/api/system/maintenance", post(system::maintenance))
++        .route("/api/system/normal", post(system::normal))
++        .route("/api/system/poweroff", post(system::poweroff))
+         .fallback(not_found)
+         .layer(Extension(replug))
+         .layer(Extension(adapter))
+@@ -102,8 +107,21 @@ pub async fn serve(
+     }
+ }
+
++/// Local read-only UI for host development, with no bridge or control routes.
++pub async fn serve_read_only(listener: TcpListener, status: Arc<Status>) -> std::io::Result<()> {
++    let app = Router::new()
++        .route("/", get(page))
++        .route("/vendor/weui.min.css", get(stylesheet))
++        .route("/api/status", get(status::api))
++        .route("/api/channels", get(channels))
++        .route("/api/settings", get(settings::get))
++        .route("/api/system", get(system::offline))
++        .with_state(status);
++    axum::serve(listener, app).await
++}
++
+ async fn page() -> impl IntoResponse {
+-    ([(header::CONTENT_TYPE, HTML)], embedded(PAGE_NAME))
++    ([(header::CONTENT_TYPE, HTML), (header::CACHE_CONTROL, "no-store")], embedded(PAGE_NAME))
+ }
+
+ async fn stylesheet() -> impl IntoResponse {
+diff --git a/src/preflight.rs b/src/preflight.rs
+new file mode 100644
+index 0000000..5af0f28
+--- /dev/null
++++ b/src/preflight.rs
+@@ -0,0 +1,38 @@
++//! Read-only diagnostics: never touches GPIO, D-Bus, USB, or writable config.
++use anyhow::{Context, Result};
++use iap2_mfi::FileCoprocessor;
++use serde_json::json;
++use std::path::Path;
++
++pub fn check() -> Result<()> {
++    let cfg = crate::config::load();
++    let dir = Path::new(crate::config::DATA_DIR);
++    let key = dir.join("identity.pk8");
++    let cert = dir.join("certificate.p7b");
++    let credentials = match (key.exists(), cert.exists()) {
++        (false, false) => "absent",
++        (true, true) => {
++            FileCoprocessor::open(dir).context("MFi files cannot be parsed")?;
++            "parsed_unverified"
++        }
++        _ => anyhow::bail!("incomplete MFi credential pair"),
++    };
++    println!("{}", serde_json::to_string_pretty(&json!({
++        "mode": "read_only_check", "version": env!("CP2CL_VERSION"),
++        "commit": env!("CP2CL_COMMIT"), "config": crate::config::json(&cfg),
++        "mfi": credentials, "carlife_key_embedded": option_env!("CARLIFE_PRIVATE_KEY").is_some_and(|s| !s.trim().is_empty()),
++        "configfs_present": Path::new("/sys/kernel/config/usb_gadget").is_dir(),
++        "udc": std::fs::read_dir("/sys/class/udc").map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>()).unwrap_or_default(),
++        "real_carplay_verified": false
++    }))?);
++    Ok(())
++}
++
++/// No GPIO, Bluetooth, gadget, credentials, configuration writes or control APIs.
++pub async fn offline_web() -> Result<()> {
++    let status = std::sync::Arc::new(crate::web::Status::new(std::sync::Arc::new(carplay_hu::report::Report::new())));
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:18080").await?;
++    eprintln!("OFFLINE ONLY: http://127.0.0.1:18080 ; no CarPlay/CarLife devices connected");
++    crate::web::serve_read_only(listener, status).await?;
++    Ok(())
++}
+diff --git a/src/web/system.rs b/src/web/system.rs
+new file mode 100644
+index 0000000..cc608a3
+--- /dev/null
++++ b/src/web/system.rs
+@@ -0,0 +1,132 @@
++//! Pi system controls, available only with the installed fixed mode helper.
++use axum::{body::Bytes, http::{HeaderMap, StatusCode}, response::Response};
++use serde_json::{json, Value};
++use std::{path::Path, sync::atomic::{AtomicBool, Ordering}, time::Duration};
++use tokio::process::Command;
++use super::json_answer;
++
++const MODE: &str = "/usr/local/sbin/cp2cl-mode";
++static PENDING: AtomicBool = AtomicBool::new(false);
++
++#[derive(Clone, Copy)]
++enum Action { Maintenance, Normal, Poweroff }
++impl Action {
++    fn mode(self) -> Option<&'static str> {
++        match self { Self::Maintenance => Some("maintenance"), Self::Normal => Some("protect"), Self::Poweroff => None }
++    }
++    fn power(self) -> &'static str { if matches!(self, Self::Poweroff) { "poweroff" } else { "reboot" } }
++}
++
++async fn command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
++    let mut cmd = Command::new(program);
++    cmd.args(args).kill_on_drop(true);
++    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await
++        .map_err(|_| "设备操作超时".to_string())?.map_err(|e| e.to_string())?;
++    if !out.status.success() {
++        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
++    }
++    Ok(out.stdout)
++}
++
++async fn read_status() -> Result<Value, String> {
++    let data = command(MODE, &["status"]).await?;
++    let mut value: Value = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
++    value["supported"] = json!(true);
++    value["pending"] = json!(PENDING.load(Ordering::SeqCst));
++    value["boot_id"] = json!(std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim());
++    Ok(value)
++}
++
++pub async fn status() -> Response {
++    if !Path::new(MODE).is_file() { return offline().await; }
++    match read_status().await {
++        Ok(data) => json_answer(StatusCode::OK, data),
++        Err(error) => json_answer(StatusCode::SERVICE_UNAVAILABLE, json!({"error":error})),
++    }
++}
++
++pub async fn offline() -> Response {
++    json_answer(StatusCode::OK, json!({"supported":false,"current":"unavailable","next_boot":"unavailable"}))
++}
++
++// JSON plus explicit confirmation avoids accidental form submissions; reject foreign origins.
++fn confirmed(headers: &HeaderMap, body: &[u8]) -> Result<(), &'static str> {
++    let content = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
++    if content.split(';').next().unwrap_or("").trim() != "application/json" { return Err("请使用 JSON 确认操作"); }
++    if let Some(origin) = headers.get("origin") {
++        let uri = origin.to_str().ok().and_then(|s| s.parse::<axum::http::Uri>().ok());
++        let host = headers.get("host").and_then(|v| v.to_str().ok());
++        if uri.as_ref().and_then(|u| u.authority()).map(|a| a.as_str()) != host || host.is_none()
++            || !matches!(uri.as_ref().and_then(|u| u.scheme_str()), Some("http" | "https")) {
++            return Err("请从本机管理页面执行操作");
++        }
++    }
++    let value: Value = serde_json::from_slice(body).map_err(|_| "无效的操作确认")?;
++    if value.get("confirm").and_then(Value::as_bool) != Some(true) { return Err("操作尚未确认"); }
++    Ok(())
++}
++
++async fn act(action: Action, headers: HeaderMap, body: Bytes) -> Response {
++    if let Err(error) = confirmed(&headers, &body) {
++        return json_answer(StatusCode::BAD_REQUEST, json!({"error":error}));
++    }
++    if !Path::new(MODE).is_file() {
++        return json_answer(StatusCode::SERVICE_UNAVAILABLE, json!({"error":"此设备未安装模式管理工具"}));
++    }
++    if PENDING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
++        return json_answer(StatusCode::CONFLICT, json!({"error":"设备操作已在进行，请稍候"}));
++    }
++    let result: Result<(), String> = async {
++        if let Some(mode) = action.mode() {
++            let current = read_status().await?;
++            let desired = if mode == "protect" { "protected" } else { "maintenance" };
++            if current["current"].as_str() == Some(desired) && current["next_boot"].as_str() == Some(desired) {
++                return Err("当前已经是所选模式".into());
++            }
++            command(MODE, &[mode]).await?;
++        }
++        // systemd owns the delayed job; it remains valid when cp2cl stops during shutdown.
++        command("/usr/bin/systemd-run", &["--unit=cp2cl-web-power", "--on-active=3s", "--collect",
++            "/usr/bin/systemctl", action.power()]).await?;
++        Ok(())
++    }.await;
++    match result {
++        Ok(()) => {
++            tracing::info!("web.system_action power={} mode={:?}", action.power(), action.mode());
++            json_answer(StatusCode::OK, json!({"ok":true,"action":action.power(),"delay_seconds":3}))
++        }
++        Err(error) => {
++            PENDING.store(false, Ordering::SeqCst);
++            tracing::warn!("web.system_action_failed err={error}");
++            json_answer(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":error}))
++        }
++    }
++}
++
++pub async fn maintenance(headers: HeaderMap, body: Bytes) -> Response { act(Action::Maintenance, headers, body).await }
++pub async fn normal(headers: HeaderMap, body: Bytes) -> Response { act(Action::Normal, headers, body).await }
++pub async fn poweroff(headers: HeaderMap, body: Bytes) -> Response { act(Action::Poweroff, headers, body).await }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn power_requires_explicit_json_confirmation_from_same_origin() {
++        let mut h = HeaderMap::new();
++        assert!(confirmed(&h, br#"{"confirm":true}"#).is_err());
++        h.insert("content-type", "application/json".parse().unwrap());
++        assert!(confirmed(&h, br#"{"confirm":false}"#).is_err());
++        assert!(confirmed(&h, br#"{}"#).is_err());
++        h.insert("host", "192.168.4.1".parse().unwrap());
++        h.insert("origin", "http://foreign.example".parse().unwrap());
++        assert!(confirmed(&h, br#"{"confirm":true}"#).is_err());
++        h.insert("origin", "http://192.168.4.1".parse().unwrap());
++        assert!(confirmed(&h, br#"{"confirm":true}"#).is_ok());
++    }
++    #[tokio::test]
++    async fn unconfirmed_power_request_is_rejected_without_scheduling() {
++        let result = poweroff(HeaderMap::new(), Bytes::from_static(b"{}")).await;
++        assert_eq!(result.status(), StatusCode::BAD_REQUEST);
++        assert!(!PENDING.load(Ordering::SeqCst));
++    }
++}

@@ -1,0 +1,26 @@
+diff --git a/crates/carplay-hu/src/wired.rs b/crates/carplay-hu/src/wired.rs
+index 92c8778..4d48d36 100644
+--- a/crates/carplay-hu/src/wired.rs
++++ b/crates/carplay-hu/src/wired.rs
+@@ -655,6 +655,8 @@ async fn attach(
+             // The cable is not going anywhere, so this session keeps the media
+             // on it.
+             now_playing: true,
++            // This server implements MFiSAP, not LIVI livi-cp MFi4.
++            mutual_authentication: false,
+         };
+
+         let (tx, rx) = mpsc::channel(64);
+diff --git a/crates/carplay-hu/src/wireless/mod.rs b/crates/carplay-hu/src/wireless/mod.rs
+index b7d3bef..c992181 100644
+--- a/crates/carplay-hu/src/wireless/mod.rs
++++ b/crates/carplay-hu/src/wireless/mod.rs
+@@ -196,6 +196,8 @@ pub(crate) fn session_params(
+         // The session that carries the media is the one over Wi-Fi; see
+         // `run_session`, which turns this off for the Bluetooth one.
+         now_playing: true,
++        // This server implements MFiSAP, not LIVI livi-cp MFi4.
++        mutual_authentication: false,
+     };
+
+     Ok(SessionParams {

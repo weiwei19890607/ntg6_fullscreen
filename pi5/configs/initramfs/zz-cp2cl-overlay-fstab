@@ -1,0 +1,20 @@
+#!/bin/sh
+# overlayroot already mounted /; do not re-submit immutable layer options on remount.
+PREREQ="overlayroot"
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in prereqs) prereqs; exit 0;; esac
+set -ef
+merged=${rootmnt:-/root}
+[ -f "$merged/media/root-ro/etc/fstab" ] || exit 0
+fstab="$merged/etc/fstab"
+[ -f "$fstab" ] || exit 0
+while IFS= read -r line || [ -n "$line" ]; do
+ set -- $line
+ if [ "$#" -ge 6 ] && [ "$2" = / ] && [ "$3" = overlay ]; then
+  printf '%s / overlay defaults %s %s\n' "$1" "$5" "$6"
+ else
+  printf '%s\n' "$line"
+ fi
+done < "$fstab" > "$fstab.cp2cl-new"
+chmod 644 "$fstab.cp2cl-new"
+mv "$fstab.cp2cl-new" "$fstab"

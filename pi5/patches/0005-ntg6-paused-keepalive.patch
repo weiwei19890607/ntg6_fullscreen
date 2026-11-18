@@ -1,0 +1,139 @@
+diff --git a/crates/carlife-md/src/carlife/session.rs b/crates/carlife-md/src/carlife/session.rs
+index 2008cb6..c82d281 100644
+--- a/crates/carlife-md/src/carlife/session.rs
++++ b/crates/carlife-md/src/carlife/session.rs
+@@ -147,6 +147,9 @@ const KEY_VR_START: i32 = 0x0000_0021;
+ /// How often the video channel is touched when there is no picture to send. The
+ /// reference does the same whenever its own interface is not in the foreground.
+ const HEARTBEAT: Duration = Duration::from_secs(1);
++/// NTG6 keeps its video watchdog active while its own desktop is displayed.
++/// Restrict the faster background keepalive to the observed DAIMLER channel.
++const PAUSED_HEARTBEAT: Duration = Duration::from_millis(100);
+
+ /// How often the car is told where the song is. The phone's own app sends the
+ /// same message no more often than this, and a second is finer than the bar it
+@@ -277,6 +280,7 @@ where
+         screen_in_force: None,
+         channel_entry: ChannelEntry::default(),
+         started_at: None,
++        video_paused: false,
+         keyframe_asked: None,
+         media_format: None,
+         navi_format: None,
+@@ -424,7 +428,7 @@ where
+                 if let Err(e) = session.tick().await {
+                     break Err(e);
+                 }
+-                session.next_tick = Instant::now() + HEARTBEAT;
++                session.next_tick = Instant::now() + session.heartbeat_period();
+             }
+             // Where the song is, which the car's bar reads. Its own schedule
+             // rather than the video tick's: the two channels are told different
+@@ -688,6 +692,8 @@ struct Session<'a, W> {
+     /// When the encoder started, which is what the video channel's timestamps
+     /// are measured from.
+     started_at: Option<Instant>,
++    /// A desktop transition pauses pictures without ending the CarLife session.
++    video_paused: bool,
+     /// When the phone was last asked for a keyframe. Nothing is asked for while
+     /// this is younger than `KEYFRAME_INTERVAL`.
+     keyframe_asked: Option<Instant>,
+@@ -1233,6 +1239,10 @@ impl<W: AsyncWrite + Unpin> Session<'_, W> {
+                     names::ServiceType(HU_VIDEO_ENCODER_START)
+                 );
+                 let now = Instant::now();
++                if self.video_paused {
++                    tracing::info!("carlife.video_resumed action=request_keyframe");
++                }
++                self.video_paused = false;
+                 self.started_at = Some(now);
+                 self.status.with(|s| s.carlife.encoding = true);
+                 // The start itself is what the car hears next, so the first
+@@ -1257,7 +1267,15 @@ impl<W: AsyncWrite + Unpin> Session<'_, W> {
+                     names::ServiceType(message.service_type)
+                 );
+                 self.started_at = None;
++                self.video_paused = message.service_type == HU_VIDEO_ENCODER_PAUSE;
+                 self.status.with(|s| s.carlife.encoding = false);
++                if self.paused_keepalive() {
++                    // Force one heartbeat now, then continue on the background
++                    // schedule. No picture is sent until the next START.
++                    self.channel_touched = None;
++                    self.next_tick = Instant::now();
++                    tracing::info!("carlife.video_paused keepalive_ms=100 channel=20062105");
++                }
+             }
+             HU_VIDEO_ENCODER_FRAME_RATE_CHANGE => {
+                 let asked = proto::decode_frame_rate(&message.body).unwrap_or(0);
+@@ -1669,6 +1687,14 @@ impl<W: AsyncWrite + Unpin> Session<'_, W> {
+         clamped(x, y, self.canvas())
+     }
+
++    fn paused_keepalive(&self) -> bool {
++        self.up && self.video_paused && self.car_channel.as_deref() == Some("20062105")
++    }
++
++    fn heartbeat_period(&self) -> Duration {
++        if self.paused_keepalive() { PAUSED_HEARTBEAT } else { HEARTBEAT }
++    }
++
+     /// Sends the video heartbeat, if the channel has been quiet long enough to
+     /// owe one.
+     ///
+@@ -1676,14 +1702,14 @@ impl<W: AsyncWrite + Unpin> Session<'_, W> {
+     /// is nothing here to send while they do. A heartbeat goes out once they
+     /// stop, which is what tells the car the channel is still ours.
+     async fn tick(&mut self) -> Result<()> {
+-        if self.started_at.is_none() {
++        if self.started_at.is_none() && !self.paused_keepalive() {
+             // Nothing has asked for a picture, so nothing is sent. The tick is
+             // still alive, because it is what notices when that changes.
+             return Ok(());
+         }
+         let idle = self
+             .channel_touched
+-            .map_or(true, |touched| touched.elapsed() >= HEARTBEAT);
++            .map_or(true, |touched| touched.elapsed() >= self.heartbeat_period());
+         if idle {
+             self.channel_touched = Some(Instant::now());
+             self.send(VIDEO_HEARTBEAT, &[]).await
+@@ -4636,6 +4662,39 @@ mod tests {
+         car.await.unwrap();
+     }
+
++    /// NTG6 must keep the same session alive while showing its own desktop.
++    #[tokio::test]
++    async fn ntg6_pause_keeps_heartbeats_and_repeated_resume_uses_the_same_session() {
++        let (device, pipe) = tokio::io::duplex(64 * 1024);
++        let status = Arc::new(Report::new());
++        let observed = status.clone();
++        let car = tokio::spawn(async move {
++            let mut car = Car { pipe };
++            car.handshake_on("20062105", asked(), asked()).await;
++            car.start_the_encoder().await;
++            for _ in 0..3 {
++                car.send(HU_VIDEO_ENCODER_PAUSE, &[]).await;
++                let first = tokio::time::timeout(
++                    Duration::from_millis(500), car.expect(VIDEO_HEARTBEAT)
++                ).await;
++                assert!(first.is_ok(), "paused NTG6 still needs a video heartbeat");
++                let second = tokio::time::timeout(
++                    Duration::from_millis(500), car.expect(VIDEO_HEARTBEAT)
++                ).await;
++                assert!(second.is_ok(), "paused keepalive must continue");
++                assert_eq!(observed.json(serde_json::Value::Null)["encoding"], false);
++                assert_eq!(observed.json(serde_json::Value::Null)["session_up"], true);
++                car.start_the_encoder().await;
++                assert_eq!(observed.json(serde_json::Value::Null)["encoding"], true);
++            }
++        });
++        let watched = Watched::default();
++        let ports = ports(quiet(), &watched, home(), status, no_location());
++        run(device, &Machine::default(), None, &ports).await.unwrap();
++        car.await.unwrap();
++        assert_eq!(*watched.sessions.lock().unwrap(), vec![true, false]);
++    }
++
+     /// A challenge with no key behind it is left alone rather than answered with
+     /// something the car would only reject, and the session carries on: the head
+     /// unit asks again every half minute and is skipped again. The absence is

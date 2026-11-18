@@ -1,0 +1,21 @@
+[Unit]
+Description=One CarLife USB reconnect after phone readiness
+Requires=cp2cl.service
+After=cp2cl.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /usr/local/lib/cp2cl/startup-replug.py
+RuntimeDirectory=cp2cl-startup
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/cp2cl-startup
+TimeoutStopSec=5
+
+[Install]
+WantedBy=cp2cl.service

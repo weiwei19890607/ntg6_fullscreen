@@ -1,3 +1,16 @@
 [submodule "vendor/LIVI"]
 	path = vendor/LIVI
 	url = https://github.com/f-io/LIVI.git
+
+[submodule "pi5/upstream/cp2cl"]
+	path = pi5/upstream/cp2cl
+	url = https://github.com/0x5e/cp2cl.git
+[submodule "pi5/upstream/ntg6_fullscreen"]
+	path = pi5/upstream/ntg6_fullscreen
+	url = https://github.com/weiwei19890607/ntg6_fullscreen.git
+[submodule "pi5/upstream/usbboot"]
+	path = pi5/upstream/usbboot
+	url = https://github.com/raspberrypi/usbboot.git
+[submodule "pi5/upstream/rpi-usb-gadget"]
+	path = pi5/upstream/rpi-usb-gadget
+	url = https://github.com/raspberrypi/rpi-usb-gadget.git

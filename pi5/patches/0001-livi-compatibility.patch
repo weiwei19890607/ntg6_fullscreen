@@ -1,0 +1,105 @@
+diff --git a/native/crates/iap2-usbmux/src/ncm.rs b/native/crates/iap2-usbmux/src/ncm.rs
+index 3988f802..79c863cc 100644
+--- a/native/crates/iap2-usbmux/src/ncm.rs
++++ b/native/crates/iap2-usbmux/src/ncm.rs
+@@ -134,7 +134,7 @@ fn open_tap(ifname: &str) -> Result<OwnedFd, String> {
+         ifr.ifr_name[i] = *b as libc::c_char;
+     }
+     ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI;
+-    if unsafe { libc::ioctl(fd, TUNSETIFF, &mut ifr) } < 0 {
++    if unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut ifr) } < 0 {
+         let e = std::io::Error::last_os_error();
+         unsafe { libc::close(fd) };
+         return Err(format!("TUNSETIFF {ifname}: {e}"));
+diff --git a/native/crates/livi-runtime/src/bringup.rs b/native/crates/livi-runtime/src/bringup.rs
+index 6d8b1949..1f668da2 100644
+--- a/native/crates/livi-runtime/src/bringup.rs
++++ b/native/crates/livi-runtime/src/bringup.rs
+@@ -45,6 +45,10 @@ pub struct CpConfig {
+     pub on_cable: Option<OnCable>,
+     pub start_again: Option<Arc<Notify>>,
+     pub theme: Option<Theme>,
++    /// Subscribe on the media link; disable on the Bluetooth negotiation link.
++    pub now_playing: bool,
++    /// Advertise mutual authentication only when the AirPlay server implements it.
++    pub mutual_authentication: bool,
+ }
+
+ pub type AskOnAir = fn() -> Option<OnAir>;
+@@ -96,8 +100,8 @@ impl core::fmt::Display for BringupError {
+
+ impl std::error::Error for BringupError {}
+
+-fn subscriptions() -> Vec<Vec<u8>> {
+-    vec![
++fn subscriptions(now_playing: bool) -> Vec<Vec<u8>> {
++    let mut messages = vec![
+         StartNowPlayingUpdates {
+             media_item_attributes: Some(StartMediaItemAttributes {
+                 persistent_id: false,
+@@ -153,7 +157,11 @@ fn subscriptions() -> Vec<Vec<u8>> {
+             start_timestamp: false,
+         }
+         .encode(),
+-    ]
++    ];
++    if !now_playing {
++        messages.remove(0);
++    }
++    messages
+ }
+
+ async fn recv<C: ControlChannel>(ch: &mut C) -> Result<Vec<u8>, BringupError> {
+@@ -300,8 +308,8 @@ fn on_cable(cp: &CpConfig, frame: &[u8]) -> Option<String> {
+     (ask.0)(&phone).then_some(phone)
+ }
+
+-fn mutual_authentication(chip_major: u8) -> Option<bool> {
+-    (chip_major == 3).then_some(true)
++fn mutual_authentication(chip_major: u8, server_supports_it: bool) -> Option<bool> {
++    (chip_major == 3 && server_supports_it).then_some(true)
+ }
+
+ fn carplay_start_session(
+@@ -436,7 +444,7 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
+         return;
+     }
+     let _ = events.send(BringupEvent::Authenticated).await;
+-    let mutual = mutual_authentication(auth.protocol_major().await.unwrap_or(0));
++    let mutual = mutual_authentication(auth.protocol_major().await.unwrap_or(0), cp.mutual_authentication);
+
+     if cp.transport == Transport::Wired {
+         let power = PowerSourceUpdate {
+@@ -449,7 +457,7 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
+         }
+     }
+
+-    for sub in subscriptions() {
++    for sub in subscriptions(cp.now_playing) {
+         if ch.send(sub).await.is_err() {
+             let _ = events.send(BringupEvent::Closed).await;
+             return;
+@@ -688,6 +696,14 @@ mod tests {
+         }
+     }
+
++    #[test]
++    fn mutual_authentication_requires_server_support_and_a_compatible_signer() {
++        assert_eq!(mutual_authentication(3, false), None);
++        assert_eq!(mutual_authentication(3, true), Some(true));
++        assert_eq!(mutual_authentication(2, true), None);
++        assert_eq!(mutual_authentication(0, true), None);
++    }
++
+     #[test]
+     fn a_theme_is_named_in_identification_and_start() {
+         let theme = Theme::parse("44C9FA31EC:985:19.0");
+@@ -800,6 +816,8 @@ mod tests {
+             on_cable: None,
+             start_again: None,
+             theme: None,
++            now_playing: true,
++            mutual_authentication: true,
+         }
+     }
+

@@ -1,0 +1,13 @@
+[Unit]
+Description=cp2cl DHCP and local DNS
+Requires=cp2cl-ap.service
+After=cp2cl-ap.service
+Before=cp2cl.service
+PartOf=cp2cl-ap.service
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+RuntimeDirectory=cp2cl-dhcp
+ExecStart=/usr/sbin/dnsmasq --user=root --keep-in-foreground --conf-file=/etc/cp2cl/dnsmasq.conf
+Restart=on-failure
+RestartSec=3

@@ -1,0 +1,11 @@
+[Unit]
+Description=Allow boot partition updates in explicit cp2cl maintenance mode
+ConditionKernelCommandLine=overlayroot=disabled
+RequiresMountsFor=/boot/firmware
+Before=cp2cl.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mount -o remount,rw /boot/firmware
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

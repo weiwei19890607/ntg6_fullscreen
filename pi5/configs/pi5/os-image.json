@@ -1,0 +1,19 @@
+{
+  "name": "Raspberry Pi OS Lite (64-bit)",
+  "description": "A port of Debian Trixie with no desktop environment (Compatible with Raspberry Pi 3/4/400/5)",
+  "icon": "https://downloads.raspberrypi.com/raspios_armhf/Raspberry_Pi_OS_(32-bit).png",
+  "url": "https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-10-06/2026-10-06-raspios-trixie-arm64-lite.img.xz",
+  "extract_size": 3078619136,
+  "extract_sha256": "b8a393dc1c3701450b5fffbfe74368a98fb6eab7415ce456cc0cead886ea8780",
+  "image_download_size": 550466056,
+  "release_date": "2026-10-06",
+  "init_format": "cloudinit-rpi",
+  "devices": [
+    "pi5-64bit",
+    "pi4-64bit",
+    "pi3-64bit"
+  ],
+  "capabilities": [
+    "rpi_connect"
+  ]
+}

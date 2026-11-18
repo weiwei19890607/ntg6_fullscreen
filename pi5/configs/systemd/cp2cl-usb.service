@@ -1,0 +1,9 @@
+[Unit]
+Description=Prepare Pi 5 USB device controller for cp2cl
+After=systemd-modules-load.service
+Before=cp2cl.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/cp2cl-prepare usb
+RemainAfterExit=yes
+TimeoutStartSec=45

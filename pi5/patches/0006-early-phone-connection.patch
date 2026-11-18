@@ -1,0 +1,643 @@
+diff --git a/crates/carlife-md/src/carlife/session.rs b/crates/carlife-md/src/carlife/session.rs
+--- a/crates/carlife-md/src/carlife/session.rs
++++ b/crates/carlife-md/src/carlife/session.rs
+@@ -327,7 +327,13 @@
+     // still has a song playing behind the panel.
+     let mut progress_at = Instant::now() + PROGRESS_PERIOD;
+
++    let mut phone_forwarding = false;
+     let outcome = loop {
++        if session.up && !phone_forwarding {
++            ports.outlet.refresh_readers(&mut media, &mut navi, &mut voice, &mut playing);
++            phone_forwarding = true;
++            tracing::info!("carlife.phone_streams_attached action=reuse_phone_session");
++        }
+         let deadline = session.next_tick;
+         let prompt_idle = session.nav_deadline;
+         tokio::select! {
+@@ -361,7 +367,7 @@
+             // The phone's sound, on the media channel. Written as it arrives,
+             // like the pictures and for the same reason: the phone is what
+             // decides when it plays.
+-            item = recv_media(&mut media) => match item {
++            item = recv_media(&mut media), if session.up => match item {
+                 Some(item) => {
+                     if let Err(e) = session.send_media(item).await {
+                         break Err(e);
+@@ -373,7 +379,7 @@
+             // The prompt, on the channel the car keeps for speech. Written as it
+             // arrives for the same reason as the music, but the end of it is
+             // also decided here: see `TTS_IDLE`.
+-            item = recv_navi(&mut navi) => match item {
++            item = recv_navi(&mut navi), if session.up => match item {
+                 Some(item) => {
+                     if let Err(e) = session.send_navi(item).await {
+                         break Err(e);
+@@ -392,7 +398,7 @@
+             // The voice channel: what the assistant says, and what the other end
+             // of a call says. Written as it arrives, like the three above —
+             // there is no idle timeout, because silence in a call is silence.
+-            item = recv_voice(&mut voice) => match item {
++            item = recv_voice(&mut voice), if session.up => match item {
+                 Some(item) => {
+                     if let Err(e) = session.send_voice(item).await {
+                         break Err(e);
+@@ -405,7 +411,7 @@
+             // arrives, like the three above: the phone is what decides when the
+             // song changes, and what the car is told is the whole of what is
+             // known, so a message says only what the phone has said.
+-            said = recv_playing(&mut playing) => match said {
++            said = recv_playing(&mut playing), if session.up => match said {
+                 Some(item) => {
+                     if let Err(e) = session.send_playing(item).await {
+                         break Err(e);
+@@ -417,7 +423,7 @@
+             },
+             // A tap on the phone's icon for us. The phone shows that icon in
+             // place of the car's own interface, so the car is told to show it.
+-            _ = ports.home.notified() => {
++            _ = ports.home.notified(), if session.up => {
+                 if let Err(e) = session.send(GO_TO_DESKTOP, &[]).await {
+                     break Err(e);
+                 }
+@@ -467,7 +473,7 @@
+     session.take_back_from_phone();
+     if session.up {
+         ports.delegate.session(false);
+-        tracing::info!("carlife.session_over action=close_carplay");
++        tracing::info!("carlife.session_over action=notify_bridge");
+     }
+     // A session that has ended is not one that is running, and the page has to
+     // say so: an encoder left "running" after the car has gone is the one thing
+@@ -2901,6 +2907,34 @@
+     /// no body: on the phone that icon stands for the car's own interface, so
+     /// the car is asked to show it.
+     #[tokio::test]
++    async fn a_preconnected_phone_does_not_speak_before_the_car_handshake() {
++        let (device, pipe) = tokio::io::duplex(64 * 1024);
++        let outlet = Arc::new(Outlet::new());
++        let sink = outlet.sink();
++        sink.media(Media::Format { rate: 48000, channels: 2 });
++        sink.media(Media::Pcm { timestamp_ms: 1, data: vec![9; 64] });
++        let car = tokio::spawn(async move {
++            let mut car = Car { pipe };
++            car.expect_silence(Duration::from_millis(100)).await;
++            car.introduce("20062105").await;
++            let init = car.expect(MEDIA_INIT).await;
++            assert_eq!(init.body, proto::media_init(48000, 2));
++            car.expect(MEDIA_STOP).await;
++            car.expect(MEDIA_INIT).await;
++            car.expect(MODULE_STATUS).await;
++            car.expect(MODULE_STATUS).await;
++            car.expect_silence(Duration::from_millis(100)).await;
++            sink.media(Media::Pcm { timestamp_ms: 2, data: vec![7; 64] });
++            let pcm = car.expect(MEDIA_DATA).await;
++            assert_eq!(pcm.body, vec![7; 64]);
++        });
++        let watched = Watched::default();
++        let ports = ports(outlet, &watched, home(), Arc::new(Report::new()), no_location());
++        run(device, &Machine::default(), None, &ports).await.unwrap();
++        car.await.unwrap();
++    }
++
++    #[tokio::test]
+     async fn a_tap_on_our_icon_asks_the_car_for_its_desktop() {
+         let (device, pipe) = tokio::io::duplex(64 * 1024);
+         let tapping = home();
+diff --git a/crates/carlife-md/src/outlet.rs b/crates/carlife-md/src/outlet.rs
+--- a/crates/carlife-md/src/outlet.rs
++++ b/crates/carlife-md/src/outlet.rs
+@@ -17,7 +17,7 @@
+ use tokio::sync::{mpsc, watch, Notify};
+
+ use crate::media::{Media, Navi, Voice};
+-use crate::now_playing::NowPlaying;
++use crate::now_playing::{NowPlaying, Track, Position};
+
+ /// How many items may wait for the car. Bounded and dropped past, so a session
+ /// that falls behind glitches instead of accumulating latency.
+@@ -83,6 +83,10 @@
+     /// Adds one picture, making room by dropping the oldest one a decoder could
+     /// not have started at.
+     fn push(&self, frame: Frame) {
++        // A preconnected phone can stream before any car owns the queue.
++        // Discard these frames without backlog warnings or keyframe requests.
++        // START requests a fresh keyframe after a consumer appears.
++        if !self.taken.load(Ordering::Relaxed) { return; }
+         let dropped = {
+             let Ok(mut waiting) = self.waiting.lock() else {
+                 return;
+@@ -156,7 +160,18 @@
+     }
+ }
+
++#[derive(Default)]
++struct Formats {
++    media: Option<(u32, u16)>,
++    navi: Option<(u32, u16)>,
++    voice: Option<(u32, u16)>,
++    track: Option<Track>,
++    position: Option<Position>,
++    artwork: Option<Vec<u8>>,
++}
++
+ pub struct Outlet {
++    formats: Arc<Mutex<Formats>>,
+     video: Arc<Video>,
+     media_tx: mpsc::Sender<Media>,
+     media_rx: Mutex<Option<mpsc::Receiver<Media>>>,
+@@ -180,6 +195,7 @@
+         let (playing_tx, playing_rx) = mpsc::channel(BACKLOG);
+         let (stream_tx, stream_rx) = watch::channel(false);
+         Self {
++            formats: Arc::new(Mutex::new(Formats::default())),
+             video: Arc::new(Video::new()),
+             media_tx,
+             media_rx: Mutex::new(Some(media_rx)),
+@@ -197,6 +213,7 @@
+     /// The sender side, for whoever produces what the car reads.
+     pub fn sink(&self) -> Arc<Sink> {
+         Arc::new(Sink {
++            formats: self.formats.clone(),
+             video: self.video.clone(),
+             media: self.media_tx.clone(),
+             navi: self.navi_tx.clone(),
+@@ -238,7 +255,38 @@
+     }
+
+     pub fn take_media(&self) -> Option<mpsc::Receiver<Media>> {
+-        Some(emptied(self.media_rx.lock().ok()?.take()?))
++        let formats = self.formats.lock().ok()?;
++        let rx = emptied(self.media_rx.lock().ok()?.take()?);
++        if let Some((rate, channels)) = formats.media {
++            let _ = self.media_tx.try_send(Media::Format { rate, channels });
++        }
++        Some(rx)
++    }
++
++    /// Drop preconnection PCM and replay the current formats/metadata once the
++    /// host has completed its handshake. The phone keeps its existing session.
++    pub fn refresh_readers(&self, media: &mut Option<mpsc::Receiver<Media>>,
++        navi: &mut Option<mpsc::Receiver<Navi>>, voice: &mut Option<mpsc::Receiver<Voice>>,
++        playing: &mut Option<mpsc::Receiver<NowPlaying>>) {
++        let Ok(state) = self.formats.lock() else { return; };
++        if let Some(rx) = media {
++            while rx.try_recv().is_ok() {}
++            if let Some((rate, channels)) = state.media { let _ = self.media_tx.try_send(Media::Format { rate, channels }); }
++        }
++        if let Some(rx) = navi {
++            while rx.try_recv().is_ok() {}
++            if let Some((rate, channels)) = state.navi { let _ = self.navi_tx.try_send(Navi::Format { rate, channels }); }
++        }
++        if let Some(rx) = voice {
++            while rx.try_recv().is_ok() {}
++            if let Some((rate, channels)) = state.voice { let _ = self.voice_tx.try_send(Voice::Format { rate, channels }); }
++        }
++        if let Some(rx) = playing {
++            while rx.try_recv().is_ok() {}
++            if let Some(track) = &state.track { let _ = self.playing_tx.try_send(NowPlaying::Track(track.clone())); }
++            if let Some(position) = state.position { let _ = self.playing_tx.try_send(NowPlaying::Position(position)); }
++            if let Some(artwork) = &state.artwork { let _ = self.playing_tx.try_send(NowPlaying::Artwork(artwork.clone())); }
++        }
+     }
+
+     pub fn return_media(&self, rx: mpsc::Receiver<Media>) {
+@@ -248,7 +296,12 @@
+     }
+
+     pub fn take_navi(&self) -> Option<mpsc::Receiver<Navi>> {
+-        Some(emptied(self.navi_rx.lock().ok()?.take()?))
++        let formats = self.formats.lock().ok()?;
++        let rx = emptied(self.navi_rx.lock().ok()?.take()?);
++        if let Some((rate, channels)) = formats.navi {
++            let _ = self.navi_tx.try_send(Navi::Format { rate, channels });
++        }
++        Some(rx)
+     }
+
+     pub fn return_navi(&self, rx: mpsc::Receiver<Navi>) {
+@@ -258,7 +311,12 @@
+     }
+
+     pub fn take_voice(&self) -> Option<mpsc::Receiver<Voice>> {
+-        Some(emptied(self.voice_rx.lock().ok()?.take()?))
++        let formats = self.formats.lock().ok()?;
++        let rx = emptied(self.voice_rx.lock().ok()?.take()?);
++        if let Some((rate, channels)) = formats.voice {
++            let _ = self.voice_tx.try_send(Voice::Format { rate, channels });
++        }
++        Some(rx)
+     }
+
+     pub fn return_voice(&self, rx: mpsc::Receiver<Voice>) {
+@@ -268,7 +326,12 @@
+     }
+
+     pub fn take_playing(&self) -> Option<mpsc::Receiver<NowPlaying>> {
+-        Some(emptied(self.playing_rx.lock().ok()?.take()?))
++        let state = self.formats.lock().ok()?;
++        let rx = emptied(self.playing_rx.lock().ok()?.take()?);
++        if let Some(track) = &state.track { let _ = self.playing_tx.try_send(NowPlaying::Track(track.clone())); }
++        if let Some(position) = state.position { let _ = self.playing_tx.try_send(NowPlaying::Position(position)); }
++        if let Some(artwork) = &state.artwork { let _ = self.playing_tx.try_send(NowPlaying::Artwork(artwork.clone())); }
++        Some(rx)
+     }
+
+     pub fn return_playing(&self, rx: mpsc::Receiver<NowPlaying>) {
+@@ -291,6 +354,7 @@
+
+ /// Where the streams go when the car is the one reading them.
+ pub struct Sink {
++    formats: Arc<Mutex<Formats>>,
+     video: Arc<Video>,
+     media: mpsc::Sender<Media>,
+     navi: mpsc::Sender<Navi>,
+@@ -337,6 +401,13 @@
+     }
+
+     pub fn media(&self, item: Media) {
++        // Retain negotiated formats even when a car has not opened a session.
++        let Ok(mut formats) = self.formats.lock() else { return; };
++        match &item {
++            Media::Format { rate, channels } => formats.media = Some((*rate, *channels)),
++            Media::Ended => formats.media = None,
++            _ => {}
++        }
+         Self::send(
+             &self.media,
+             item,
+@@ -347,6 +418,13 @@
+     }
+
+     pub fn navi(&self, item: Navi) {
++        // Retain negotiated formats even when a car has not opened a session.
++        let Ok(mut formats) = self.formats.lock() else { return; };
++        match &item {
++            Navi::Format { rate, channels } => formats.navi = Some((*rate, *channels)),
++            Navi::Ended => formats.navi = None,
++            _ => {}
++        }
+         Self::send(
+             &self.navi,
+             item,
+@@ -357,6 +435,13 @@
+     }
+
+     pub fn voice(&self, item: Voice) {
++        // Retain negotiated formats even when a car has not opened a session.
++        let Ok(mut formats) = self.formats.lock() else { return; };
++        match &item {
++            Voice::Format { rate, channels } => formats.voice = Some((*rate, *channels)),
++            Voice::Ended => formats.voice = None,
++            _ => {}
++        }
+         Self::send(
+             &self.voice,
+             item,
+@@ -369,6 +454,18 @@
+     /// A record rather than a flow: what a car that is not reading did not hear
+     /// is stale, so both ways of having nowhere to go are one line.
+     pub fn playing(&self, item: NowPlaying) {
++        let Ok(mut state) = self.formats.lock() else { return; };
++        match &item {
++            NowPlaying::Track(update) => {
++                if update.song.is_some() && state.track.as_ref().and_then(|track| track.song.as_ref()) != update.song.as_ref() {
++                    state.artwork = None;
++                    state.position = None;
++                }
++                state.track.get_or_insert_with(Track::default).merge(update.clone());
++            }
++            NowPlaying::Position(position) => state.position = Some(*position),
++            NowPlaying::Artwork(data) => state.artwork = Some(data.clone()),
++        }
+         if self.playing.try_send(item).is_err()
+             && !self.playing_dropped.swap(true, Ordering::Relaxed)
+         {
+@@ -384,6 +481,43 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn preconnected_audio_formats_are_replayed_without_stale_samples() {
++        let outlet = Outlet::new();
++        let sink = outlet.sink();
++        sink.media(Media::Format { rate: 48000, channels: 2 });
++        sink.navi(Navi::Format { rate: 16000, channels: 1 });
++        sink.voice(Voice::Format { rate: 16000, channels: 1 });
++        for _ in 0..100 { sink.media(Media::Pcm { timestamp_ms: 0, data: vec![0] }); }
++        let mut media = outlet.take_media().unwrap();
++        assert!(matches!(media.try_recv(), Ok(Media::Format { rate: 48000, channels: 2 })));
++        assert!(media.try_recv().is_err());
++        let mut navi = outlet.take_navi().unwrap();
++        assert!(matches!(navi.try_recv(), Ok(Navi::Format { rate: 16000, channels: 1 })));
++        let mut voice = outlet.take_voice().unwrap();
++        assert!(matches!(voice.try_recv(), Ok(Voice::Format { rate: 16000, channels: 1 })));
++        sink.media(Media::Ended);
++        outlet.return_media(media);
++        assert!(outlet.take_media().unwrap().try_recv().is_err());
++    }
++
++    #[tokio::test]
++    async fn preconnected_video_is_discarded_without_requesting_keyframes() {
++        let outlet = Outlet::new();
++        let sink = outlet.sink();
++        let asks = outlet.keyframe_requests();
++        for _ in 0..1000 { sink.video(vec![1], false); }
++        assert_eq!(*asks.borrow(), 0);
++        let video = outlet.take_video().unwrap();
++        assert!(video.try_recv().is_none());
++        sink.video(vec![2], true);
++        assert!(video.recv().await.keyframe);
++        outlet.return_video();
++        for _ in 0..1000 { sink.video(vec![1], false); }
++        assert_eq!(*asks.borrow(), 0);
++    }
++
+
+     /// Queues are handed over one at a time and a session starts on an empty
+     /// one: what the last car left belongs to a car that is no longer there.
+diff --git a/src/config.rs b/src/config.rs
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -184,6 +184,8 @@
+     /// The screen the settings page picked. `main` reads it at startup and
+     /// `carlife::gadget` again for each session; empty is the car's own screen.
+     pub screen: Screen,
++    /// Connect the phone before the car opens CarLife; requires a fixed screen.
++    pub early_connect: bool,
+ }
+
+ impl Default for Config {
+@@ -196,7 +198,20 @@
+             log_level: LevelFilter::INFO,
+             addr: "0.0.0.0:80".to_string(),
+             screen: Screen::default(),
+-        }
++            early_connect: false,
++        }
++    }
++}
++
++impl Config {
++    /// A known canvas is essential: guessing would require reconnecting the phone.
++    pub fn early_geometry(&self) -> Option<carplay_hu::Geometry> {
++        if !self.early_connect { return None; }
++        let size = self.screen.resolution?;
++        Some(carplay_hu::Geometry {
++            width: size.width, height: size.height, fps: self.screen.fps?,
++            ..carplay_hu::Geometry::default()
++        })
+     }
+ }
+
+@@ -283,6 +298,7 @@
+     };
+     Config {
+         screen: Screen { resolution, fps },
++        early_connect: value["early_connect"].as_bool().unwrap_or(false),
+         log_level: level(value, defaults.log_level),
+         wifi_iface: text(value, "wifi_iface", &defaults.wifi_iface),
+         bt_adapter: text(value, "bt_adapter", &defaults.bt_adapter),
+@@ -354,6 +370,7 @@
+             "height": config.screen.resolution.map(|r| r.height),
+             "fps": config.screen.fps,
+         },
++        "early_connect": config.early_connect,
+         "log_level": level_name(config.log_level),
+         "wifi_iface": config.wifi_iface,
+         "bt_adapter": config.bt_adapter,
+@@ -372,6 +389,22 @@
+     }
+
+     use super::*;
++
++    #[test]
++    fn early_connection_requires_fixed_geometry_and_survives_config_save() {
++        let mut config = Config::default();
++        assert!(config.early_geometry().is_none());
++        config.early_connect = true;
++        assert!(config.early_geometry().is_none());
++        config.screen.resolution = Some(Resolution { width: 1920, height: 720 });
++        assert!(config.early_geometry().is_none());
++        config.screen.fps = Some(60);
++        let roundtrip = from_value(&json(&config));
++        assert!(roundtrip.early_connect);
++        assert_eq!(roundtrip.early_geometry().unwrap().width, 1920);
++        assert_eq!(roundtrip.early_geometry().unwrap().fps, 60);
++    }
++
+
+     #[test]
+     fn a_machine_with_no_controller_still_has_a_mac_shaped_address_to_report() {
+diff --git a/src/hooks.rs b/src/hooks.rs
+--- a/src/hooks.rs
++++ b/src/hooks.rs
+@@ -9,9 +9,8 @@
+ //! The phone's half reports how far a phone got, which is the third fact the
+ //! lights are drawn from, and says when its icon was tapped.
+ //!
+-//! Nothing here is policy either half could have had. A session is the only
+-//! thing that knows when the CarPlay half should be open, which is why that
+-//! switch is thrown here rather than watched there.
++//! The bridge keeps phone admission open in early mode, independently of
++//! whether the car has entered CarLife. Geometry changes still renegotiate.
+
+ use std::sync::Arc;
+
+@@ -31,9 +30,9 @@
+ /// The one object both halves are given: it answers for each of them as the
+ /// host that is told what happened, and as where a key goes.
+ pub struct Hooks {
+-    /// Whether the CarPlay half accepts anything at all. Shut until a head unit
+-    /// has been told who this device is, and shut again when it goes.
++    /// Phone admission follows the car unless early connection is enabled.
+     carplay: watch::Sender<bool>,
++    early_connect: bool,
+     /// Bumped when a running CarPlay session should read `/info` again.
+     restart: watch::Sender<u64>,
+     /// The size the car named, which is what `/info` answers with.
+@@ -55,6 +54,7 @@
+ impl Hooks {
+     pub fn new(
+         carplay: watch::Sender<bool>,
++        early_connect: bool,
+         restart: watch::Sender<u64>,
+         screen: watch::Sender<Option<Geometry>>,
+         channel_id: watch::Sender<Option<String>>,
+@@ -65,6 +65,7 @@
+     ) -> Arc<Self> {
+         Arc::new(Self {
+             carplay,
++            early_connect,
+             restart,
+             screen,
+             channel_id,
+@@ -99,9 +100,9 @@
+
+ impl Delegate for Hooks {
+     fn session(&self, up: bool) {
+-        let _ = self.carplay.send(up);
++        let _ = self.carplay.send(up || self.early_connect);
+         self.lights.carlife(up);
+-        if up {
++        if up && !self.early_connect {
+             // The phone will not start CarPlay on its own — it has to be told
+             // again — and a fresh iAP2 session is how it is told.
+             self.changed();
+@@ -122,7 +123,7 @@
+             return;
+         }
+         tracing::info!("carplay.video.screen_named width={width} height={height} fps={fps}");
+-        let _ = self.screen.send(Some(wanted));
++        self.screen.send_replace(Some(wanted));
+         self.changed();
+     }
+
+@@ -229,3 +230,46 @@
+         Command::Night(on) => Phone::Night(on),
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn hooks(early: bool) -> (Arc<Hooks>, watch::Receiver<bool>, watch::Receiver<u64>) {
++        let (gate, gate_in) = watch::channel(early);
++        let (restart, restart_in) = watch::channel(0);
++        let geometry = Geometry { width: 1920, height: 720, fps: 60, ..Geometry::default() };
++        let (screen, _) = watch::channel(Some(geometry));
++        let (channel, _) = watch::channel(None);
++        let (lights, _) = led::Signals::new();
++        (Hooks::new(gate, early, restart, screen, channel, Arc::new(Notify::new()),
++            lights, Events::new(), Arc::new(Vehicle::default())), gate_in, restart_in)
++    }
++
++    #[test]
++    fn preconnected_phone_survives_car_start_stop_and_same_screen() {
++        let (hooks, gate, restart) = hooks(true);
++        for _ in 0..3 {
++            hooks.screen_named(1920, 720, 60);
++            hooks.session(true);
++            hooks.session(false);
++            assert!(*gate.borrow());
++            assert_eq!(*restart.borrow(), 0, "car arrival must not restart the phone");
++        }
++        hooks.screen_named(1280, 720, 30);
++        assert_eq!(*restart.borrow(), 1, "a genuinely changed canvas must renegotiate");
++        hooks.screen_named(1280, 720, 30);
++        assert_eq!(*restart.borrow(), 1);
++    }
++
++    #[test]
++    fn normal_mode_still_follows_the_car() {
++        let (hooks, gate, restart) = hooks(false);
++        assert!(!*gate.borrow());
++        hooks.session(true);
++        assert!(*gate.borrow());
++        assert_eq!(*restart.borrow(), 1);
++        hooks.session(false);
++        assert!(!*gate.borrow());
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -191,7 +191,9 @@
+     // What the phone is asked to render: the CarLife session writes it once a
+     // head unit has said what its screen is, and `GET /info` is answered from it.
+     // Until then nothing has, and the default stands.
+-    let (screen, screen_in) = watch::channel::<Option<Geometry>>(None);
++    let early_screen = cfg.early_geometry();
++    let early_connect = early_screen.is_some();
++    let (screen, screen_in) = watch::channel::<Option<Geometry>>(early_screen);
+
+     // Which channel the head unit on the other end is, once it has said. `GET
+     // /info` is answered from it, so the phone is shown the icon and the label
+@@ -276,10 +278,12 @@
+     // longest one in a session's first seconds with no other line in it.
+     tokio::spawn(ap::run(cfg.wifi_iface.clone()));
+
+-    // Whether the CarPlay half is open for the phone at all. It starts shut and
+-    // the car's session is the only thing that opens it: nothing is published
+-    // and nothing is accepted until there is a head unit on the other end.
+-    let (gateway, gate) = watch::channel(false);
++    // A fixed configured screen permits connecting the phone before CarLife.
++    let (gateway, gate) = watch::channel(early_connect);
++    tracing::info!("main.bridge.early_connect enabled={early_connect} screen={}", cfg.screen);
++    if cfg.early_connect && !early_connect {
++        tracing::warn!("main.bridge.early_connect_disabled reason=fixed_screen_required");
++    }
+
+     // What the car is shown while the phone has nothing to show it: frames built
+     // into the binary, pushed onto the video queue for as long as there is a car
+@@ -299,6 +303,7 @@
+     // what happened, as the asset table, and as where a key goes.
+     let hooks = hooks::Hooks::new(
+         gateway.clone(),
++        early_connect,
+         restart.clone(),
+         screen,
+         channel_id,
+@@ -341,10 +346,7 @@
+         restart: restart.clone(),
+     })?;
+
+-    // The car comes first and CarPlay follows it: nothing is published and
+-    // nothing is accepted until there is a head unit on the other end of the
+-    // bridge, and both go away again when it does. Which of the two switched
+-    // sides is open is the CarLife half's to say, and this is where it says it.
++    // In early mode the phone remains available across CarLife sessions.
+
+     // What the CarLife half is told about the machine. None of it is a choice:
+     // the hostname is the name the device goes by, the device tree is its maker,
+@@ -359,7 +361,7 @@
+         data_dir,
+     };
+
+-    tracing::info!("main.bridge.carlife_up carplay_side=waiting");
++    tracing::info!("main.bridge.carlife_up carplay_side={}", if early_connect { "preconnecting" } else { "waiting" });
+     // Read once, here rather than in the task below: there is one key, and every
+     // session the car gets is answered with it.
+     let carlife_auth = carlife_signer();
+diff --git a/src/sink.rs b/src/sink.rs
+--- a/src/sink.rs
++++ b/src/sink.rs
+@@ -81,7 +81,7 @@
+     /// from here, makes it fit, and puts the result on the queue.
+     covers: UnboundedSender<Vec<u8>>,
+     /// Parameter sets from the newest codec description, put in front of the
+-    /// next frame. Held outside the queue deliberately: the queue can be full,
++    /// next keyframe. Retained across late car arrivals: the queue can be full,
+     /// and a dropped SPS/PPS costs everything that follows it.
+     pending: Mutex<Vec<u8>>,
+     /// Which instance of which stream each of the three audio channels is being
+@@ -123,7 +123,7 @@
+                 let mut access_unit = self
+                     .pending
+                     .lock()
+-                    .map(|mut pending| std::mem::take(&mut *pending))
++                    .map(|pending| if keyframe { pending.clone() } else { Vec::new() })
+                     .unwrap_or_default();
+                 access_unit.extend_from_slice(&data);
+                 // Whether a decoder can start here goes with the picture: the
+@@ -264,6 +264,18 @@
+     fn sink(outlet: &Outlet) -> Arc<ClSink> {
+         let (covers, _) = tokio::sync::mpsc::unbounded_channel();
+         Arc::new(ClSink::new(outlet.sink(), covers))
++    }
++
++    #[test]
++    fn a_late_car_receives_parameter_sets_with_a_fresh_keyframe() {
++        let outlet = Outlet::new();
++        let sink = sink(&outlet);
++        sink.push(StreamEvent::VideoConfig { parameter_sets: vec![vec![0, 0, 0, 1, 0x67]] });
++        sink.push(StreamEvent::VideoFrame { data: vec![0x65], keyframe: true });
++        let video = outlet.take_video().unwrap();
++        assert!(video.try_recv().is_none());
++        sink.push(StreamEvent::VideoFrame { data: vec![0x65], keyframe: true });
++        assert_eq!(video.try_recv().unwrap().data, vec![0, 0, 0, 1, 0x67, 0x65]);
+     }
+
+     /// One stream: a type the phone names it with, and the instance it opened.

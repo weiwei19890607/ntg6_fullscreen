@@ -1,0 +1,155 @@
+diff --git a/crates/carlife-md/src/carlife/gadget.rs b/crates/carlife-md/src/carlife/gadget.rs
+index 2db0387..d1f12e7 100644
+--- a/crates/carlife-md/src/carlife/gadget.rs
++++ b/crates/carlife-md/src/carlife/gadget.rs
+@@ -13,6 +13,10 @@
+ //! the numbers and strings a switched phone carries: `usb::Usb::reidentify`. The
+ //! interface itself does not change — a head unit takes the accessory's endpoints
+ //! by position, and both forms have the same two.
++//!
++//! The Pi 5 build starts in accessory form so a head unit can open CarLife
++//! immediately, without first choosing to send AOA's switch request. Whether
++//! NTG6 automatically opens its UI remains a head-unit compatibility test.
+
+ use std::fs;
+ use std::io;
+@@ -110,7 +114,8 @@ impl<'a> Md<'a> {
+             mut replug,
+             auth,
+         } = self;
+-        let identity = desc::Identity::phone(&settings.name, &settings.vendor);
++        let identity = desc::Identity::phone(&settings.name, &settings.vendor).accessory();
++        tracing::info!("usb.startup mode=accessory identity={:?}", identity.describe());
+     let (usb, endpoints) = Usb::open(&identity)?;
+     let Endpoints {
+         control,
+@@ -419,6 +424,7 @@ async fn switch(usb: &Usb, identity: &mut desc::Identity) -> Result<()> {
+ /// seeing a phone and a car seeing an accessory.
+ fn describe_identity(status: &Report, identity: &desc::Identity) {
+     status.with(|s| {
++        s.carlife.accessory = identity.is_accessory();
+         s.carlife.usb.vid = Some(identity.vid);
+         s.carlife.usb.pid = Some(identity.pid);
+         s.carlife.usb.manufacturer = Some(identity.manufacturer.clone());
+diff --git a/crates/carlife-md/src/carlife/session.rs b/crates/carlife-md/src/carlife/session.rs
+index 427b413..2008cb6 100644
+--- a/crates/carlife-md/src/carlife/session.rs
++++ b/crates/carlife-md/src/carlife/session.rs
+@@ -153,16 +153,9 @@ const HEARTBEAT: Duration = Duration::from_secs(1);
+ /// draws moves.
+ const PROGRESS_PERIOD: Duration = Duration::from_secs(1);
+
+-/// How long a car is given to say the first thing before the pipe is probed.
+-///
+-/// A head unit that speaks at all speaks within milliseconds of the pipe
+-/// opening — it is the car that opens the conversation — so this is only ever
+-/// reached by one that is not going to.
+-const PROBE_QUIET: Duration = Duration::from_secs(2);
+-
+-/// How long the probe's write is waited on. A host that is reading the endpoint
+-/// takes it in one transfer; one that is not never does.
+-const PROBE_WAIT: Duration = Duration::from_secs(1);
++/// Report a head unit that has not started its handshake yet, without putting
++/// a speculative frame on the pipe. It may legitimately open CarLife later.
++const HANDSHAKE_WAIT_NOTICE: Duration = Duration::from_secs(2);
+
+ /// How often the phone may be asked for a keyframe.
+ ///
+@@ -319,13 +312,11 @@ where
+         status: ports.report.clone(),
+     };
+
+-    // A car that has configured the pipe and then said nothing is either one
+-    // that never opened it or one that is waiting for this side to speak first,
+-    // and from here the two look the same: a read that waits for ever. One
+-    // frame tells them apart — see `probe` — and only where the car has been
+-    // quiet long enough that there is nothing else it could be doing.
+-    let probe_at = Instant::now() + PROBE_QUIET;
+-    let mut probed = false;
++    // A timeout must not cancel a two-write frame: the outer header can remain
++    // queued without its body and corrupt the first later handshake response.
++    // Leave the pipe silent until the head unit starts, and only report the wait.
++    let notice_at = Instant::now() + HANDSHAKE_WAIT_NOTICE;
++    let mut wait_reported = false;
+
+     // The panel's bar is on a schedule of its own: it is the media channel's
+     // clock rather than the video one's, and a session whose picture is paused
+@@ -444,11 +435,9 @@ where
+                 }
+                 progress_at = Instant::now() + PROGRESS_PERIOD;
+             }
+-            // Nothing from the car since the pipe opened, and the handshake
+-            // has not got as far as `up`. See `probe`.
+-            _ = tokio::time::sleep_until(probe_at), if !probed && !session.up => {
+-                probed = true;
+-                session.probe().await;
++            _ = tokio::time::sleep_until(notice_at), if !wait_reported && !session.up => {
++                wait_reported = true;
++                tracing::info!("usb.protocol_wait reason=car_session_not_up action=listen");
+             }
+         }
+     };
+@@ -1704,32 +1693,6 @@ impl<W: AsyncWrite + Unpin> Session<'_, W> {
+     }
+
+ 
+-    /// Writes one frame into a pipe the car has not used, and says what became
+-    /// of it.
+-    ///
+-    /// What a write costs is the only thing this side can learn about the other:
+-    /// it completes once the host has read the endpoint, and it does not while
+-    /// nobody is reading. So a car that configured the device and then went
+-    /// quiet is told apart by one frame — a host that takes it is a host that is
+-    /// listening and waiting to be spoken to, and one that leaves it queued
+-    /// never opened the pipe at all. The frame is a video heartbeat: the
+-    /// emptiest message the protocol has, and one a head unit that has not
+-    /// started the encoder drops.
+-    ///
+-    /// The wait is bounded, and a write still queued when it runs out is left
+-    /// where it is: it goes out if the host ever reads, and until then it costs
+-    /// a blocking thread that nothing waits on.
+-    async fn probe(&mut self) {
+-        match tokio::time::timeout(PROBE_WAIT, self.send(VIDEO_HEARTBEAT, &[])).await {
+-            Ok(Ok(())) => tracing::info!("usb.probe result=written"),
+-            Ok(Err(e)) => tracing::warn!("usb.probe result=failed err={e:#}"),
+-            Err(_) => tracing::warn!(
+-                "usb.probe result=not_taken waited_ms={}",
+-                PROBE_WAIT.as_millis()
+-            ),
+-        }
+-    }
+-
+     /// One picture from the CarPlay side, on the video channel.
+     ///
+     /// A frame that arrives before the car has started the encoder, or while it
+@@ -2861,6 +2824,30 @@ mod tests {
+         body
+     }
+
++    /// A head unit may open CarLife well after USB enumeration.
++    #[tokio::test]
++    async fn a_late_host_gets_no_partial_probe_before_its_protocol_reply() {
++        use tokio::io::AsyncReadExt;
++
++        // Only an outer header fits. Cancelling a two-write probe here used to
++        // leave its header queued and splice the next reply into its body.
++        let (device, pipe) = tokio::io::duplex(8);
++        let car = tokio::spawn(async move {
++            let mut car = Car { pipe };
++            tokio::time::sleep(HANDSHAKE_WAIT_NOTICE + Duration::from_millis(1200)).await;
++            let mut byte = [0u8; 1];
++            assert!(tokio::time::timeout(
++                Duration::from_millis(20), car.pipe.read(&mut byte)
++            ).await.is_err(), "a quiet pipe must not contain an unfinished probe");
++            car.send(HU_PROTOCOL_VERSION, &[0x08, 0x02, 0x10, 0x00]).await;
++            car.expect(MATCH_STATUS).await;
++        });
++        let watched = Watched::default();
++        let ports = ports(quiet(), &watched, home(), Arc::new(Report::new()), no_location());
++        run(device, &Machine::default(), None, &ports).await.unwrap();
++        car.await.unwrap();
++    }
++
+     /// What a phone makes of a car that names this channel.
+     async fn verdict(channel: String) -> bool {
+         let (device, pipe) = tokio::io::duplex(64 * 1024);
