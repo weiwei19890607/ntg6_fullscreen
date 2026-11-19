@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded USB re-enumerations after the phone is ready but CarLife is not.
+"""USB re-enumerations until CarLife starts: five fast tries, then slow retries.
 
 Uses the same local API as the web restart button. Never restarts cp2cl or the
 phone; a volatile marker prevents another retry series after helper/service restarts.
@@ -73,29 +73,30 @@ def device_request(base, path, post=False, udc_root=Path('/sys/class/udc')):
     return answer
 
 
-def run(base, marker=MARKER, settle=0, wait=180, fetch=request,
-        clock=time.monotonic, sleep=time.sleep, max_attempts=5,
-        retry_interval=3, enumeration_timeout=15):
+def run(base, marker=MARKER, settle=0, wait=None, fetch=request,
+        clock=time.monotonic, sleep=time.sleep, fast_attempts=5,
+        retry_interval=3, slow_interval=10, enumeration_timeout=15):
     if marker.exists():
         print('startup_replug skipped=already_handled_this_boot', flush=True)
         return
     policy = Decision(settle)
-    deadline = clock()+wait
+    deadline = None if wait is None else clock()+wait
     attempts = 0
     phase = 'ready'
     phase_deadline = None
     retry_at = None
     print(f'startup_replug waiting=phone_video_and_usb settle_s={settle} '
-          f'timeout_s={wait} max_attempts={max_attempts} retry_interval_s={retry_interval}', flush=True)
-    while clock() < deadline:
+          f'readiness_timeout_s={wait} fast_attempts={fast_attempts} '
+          f'retry_interval_s={retry_interval} slow_interval_s={slow_interval}', flush=True)
+    while attempts or deadline is None or clock() < deadline:
         try:
             status = fetch(base, '/api/status')
             action = policy.observe(status, clock())
         except (OSError, ValueError, TypeError, AttributeError):
             policy.unavailable()
             if phase_deadline is not None and clock() >= phase_deadline:
-                print('startup_replug stopped=enumeration_timeout', flush=True)
-                return
+                print('startup_replug waiting=usb_cycle retry_held=true', flush=True)
+                phase_deadline = clock()+enumeration_timeout
             sleep(0.1)
             continue
         if action == 'car_started':
@@ -106,16 +107,16 @@ def run(base, marker=MARKER, settle=0, wait=180, fetch=request,
         enumerated = status.get('carlife', {}).get('usb', {}).get('enumerated') is True
         if phase in ('disconnect', 'enumerate'):
             if clock() >= phase_deadline:
-                print('startup_replug stopped=enumeration_timeout', flush=True)
-                return
+                print('startup_replug waiting=usb_cycle retry_held=true', flush=True)
+                phase_deadline = clock()+enumeration_timeout
             if phase == 'disconnect' and not enumerated:
                 phase = 'enumerate'
             elif phase == 'enumerate' and enumerated:
                 phase = 'cooldown'
                 phase_deadline = None
-                retry_at = clock()+retry_interval
+                retry_at = clock()+(retry_interval if attempts < fast_attempts else slow_interval)
                 print(f'startup_replug enumerated=true attempt={attempts} '
-                      f'handshake_wait_s={retry_interval}', flush=True)
+                      f'handshake_wait_s={retry_interval if attempts < fast_attempts else slow_interval}', flush=True)
             sleep(0.1)
             continue
         if phase == 'cooldown':
@@ -123,13 +124,10 @@ def run(base, marker=MARKER, settle=0, wait=180, fetch=request,
                 # Do not count disconnected time as a handshake opportunity.
                 retry_at = None
             elif retry_at is None:
-                retry_at = clock()+retry_interval
+                retry_at = clock()+(retry_interval if attempts < fast_attempts else slow_interval)
             if retry_at is None or clock() < retry_at:
                 sleep(0.1)
                 continue
-            if attempts >= max_attempts:
-                print(f'startup_replug stopped=attempt_limit attempts={attempts}', flush=True)
-                return
         if action == 'replug':
             # Recheck immediately before requesting disconnection.
             try:
@@ -160,7 +158,7 @@ def run(base, marker=MARKER, settle=0, wait=180, fetch=request,
                 print(f'startup_replug response_uncertain={type(error).__name__} retry=false', flush=True)
                 return
             # Require an observed disconnect/re-enumeration cycle. Never start
-            # the 3-second handshake timer from the asynchronous POST response.
+            # the handshake timer from the asynchronous POST response.
             phase = 'disconnect'
             phase_deadline = clock()+enumeration_timeout
             policy.unavailable()

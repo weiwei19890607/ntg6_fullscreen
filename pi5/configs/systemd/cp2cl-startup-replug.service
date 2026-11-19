@@ -1,5 +1,5 @@
 [Unit]
-Description=Bounded CarLife USB reconnects after phone readiness
+Description=CarLife USB reconnects until the head unit starts its handshake
 Requires=cp2cl.service
 After=cp2cl.service
 

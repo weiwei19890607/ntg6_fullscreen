@@ -59,6 +59,8 @@ class StartupReplug(unittest.TestCase):
                 if fail_post: raise OSError('uncertain HTTP response')
                 return {'ok': True}
             status = copy.deepcopy(first or READY)
+            if any(post for _, post in calls) and now[0] >= 5:
+                status['carlife']['protocol'] = [2, 0]
             if final_handshake and len(calls) == 3:
                 status['carlife']['protocol'] = [2, 0]
             return status
@@ -99,7 +101,7 @@ class StartupReplug(unittest.TestCase):
         self.assertFalse(any(post for _, post in calls))
         self.assertIsNone(marker)
 
-    def simulate_retries(self, handshake=None, lose_phone=False, cycle=True,
+    def simulate_retries(self, handshake=24, lose_phone=False, cycle=True,
                          fail_get=False, fail_post=False, final_check=False):
         now = [0.0]
         posts = []
@@ -119,7 +121,7 @@ class StartupReplug(unittest.TestCase):
                     status['carlife']['usb']['enumerated'] = False
                 if lose_phone:
                     status['carplay']['video']['active'] = False
-                if fail_get:
+                if fail_get and now[0] < 20:
                     raise OSError('status unavailable')
                 if final_check and len(posts) == 1 and age >= 4:
                     final_reads[0] += 1
@@ -136,13 +138,30 @@ class StartupReplug(unittest.TestCase):
             self.assertEqual(len(posts), count)
         return posts, now[0]
 
-    def test_five_attempt_limit_and_three_seconds_after_each_enumeration(self):
+    def test_first_five_attempts_wait_three_seconds_after_enumeration(self):
         posts, elapsed = self.simulate_retries()
         self.assertEqual(len(posts), 5)
         for first, second in zip(posts, posts[1:]):
             self.assertGreaterEqual(second-first, 4-1e-9)
             self.assertLess(second-first, 4.4)
-        self.assertGreaterEqual(elapsed-posts[-1], 4-1e-9)
+        self.assertGreaterEqual(elapsed-posts[-1], 7)
+
+    def test_after_five_attempts_retry_every_ten_seconds_after_enumeration(self):
+        posts, elapsed = self.simulate_retries(handshake=75)
+        self.assertGreater(len(posts), 5)
+        for first, second in zip(posts[4:], posts[5:]):
+            self.assertGreaterEqual(second-first, 11-1e-9)
+            self.assertLess(second-first, 11.4)
+        self.assertGreaterEqual(elapsed, 75)
+
+    def test_slow_retries_continue_past_initial_readiness_deadline(self):
+        posts, elapsed = self.simulate_retries(handshake=210)
+        self.assertGreater(posts[-1], 180)
+        self.assertGreaterEqual(elapsed, 210)
+
+    def test_handshake_during_slow_wait_stops_before_sixth_attempt(self):
+        posts, elapsed = self.simulate_retries(handshake=23)
+        self.assertEqual(len(posts), 5)
 
     def test_handshake_during_reenumeration_stops_retries(self):
         posts, elapsed = self.simulate_retries(handshake=0.3)
@@ -165,16 +184,16 @@ class StartupReplug(unittest.TestCase):
     def test_missing_disconnect_edge_never_counts_as_reenumeration(self):
         posts, elapsed = self.simulate_retries(cycle=False)
         self.assertEqual(len(posts), 1)
-        self.assertLess(elapsed, 16)
+        self.assertGreaterEqual(elapsed, 24)
 
     def test_lost_phone_prevents_further_attempts(self):
         posts, elapsed = self.simulate_retries(lose_phone=True)
         self.assertEqual(len(posts), 1)
 
-    def test_unavailable_status_during_enumeration_stops_at_timeout(self):
+    def test_unavailable_status_during_enumeration_waits_without_replugging(self):
         posts, elapsed = self.simulate_retries(fail_get=True)
         self.assertEqual(len(posts), 1)
-        self.assertLess(elapsed, 16)
+        self.assertGreaterEqual(elapsed, 24)
 
     def test_uncertain_post_never_retries_the_series(self):
         posts, elapsed = self.simulate_retries(fail_post=True)

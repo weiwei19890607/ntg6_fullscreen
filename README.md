@@ -4,7 +4,7 @@
 
 **针对树莓派 5 的移植方案见 [pi5/README.md](pi5/README.md)**。开发主机为 Ubuntu 26.04，树莓派运行 Raspberry Pi OS Lite 64-bit（Debian 13）。已在奔驰 NTG6 实车验证无线 CarPlay → USB CarLife、1920×720@60 配置、提前连接手机，以及视频通道就绪后自动重连 USB 拉起画面；另提供只读运行、维护模式和网页关机功能。完整脚本、补丁和验证文档位于 [`pi5/`](pi5/)。此方案使用 Raspberry Pi OS，与下文现有 Buildroot 固件适配列表区分。
 
-最新重试策略：手机就绪后首次立即重连，实际重新枚举后等待 **3 秒**，仍无握手则重试，每次开机最多 **5 次（含首次）**；一旦检测到握手立即停止。新策略已完成单测和 Pi 侧验证，NTG6 实车可靠性仍待复测，详见 [自动重连说明](pi5/docs/14-ntg6-startup-replug.md)。
+最新重试策略：手机就绪后首次立即重连，前 **5 次**尝试之间在重新枚举后等待 **3 秒**；第 5 次和后续每次重新枚举后等待 **10 秒**，无握手则持续重试，不设次数上限。一旦检测到握手立即停止；手机未就绪或 USB 未重新枚举时暂停新重连。新策略的 NTG6 实车可靠性仍待复测，详见 [自动重连说明](pi5/docs/14-ntg6-startup-replug.md)。
 
 [![license](https://img.shields.io/github/license/0x5e/cp2cl)](LICENSE) [![build](https://github.com/0x5e/cp2cl/actions/workflows/build.yml/badge.svg)](https://github.com/0x5e/cp2cl/actions/workflows/build.yml) [![release](https://img.shields.io/github/v/release/0x5e/cp2cl)](https://github.com/0x5e/cp2cl/releases/latest) ![arch](https://img.shields.io/badge/arch-aarch64%20%7C%20armv7-informational)
 
